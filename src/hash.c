@@ -34,11 +34,6 @@ void ClearHash(Hash *this)
         this->cellStart[i] = 0;
     }
 
-    for(size_t i = 0; i < MAX_PARTICLE_COUNT; i++)
-    {
-        this->denseGrid[i] = 0;
-    }
-
     arrsetlen(this->queryResults, 0);
 }
 
