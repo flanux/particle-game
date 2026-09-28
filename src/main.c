@@ -78,17 +78,46 @@ int main (int argc, char *argv[])
         UpdateParticles(particleSystem, deltaTime);
 
         emitter->position = GetMousePosition();
-        FORCE(particleSystem, attractor).position = GetMousePosition();
-        FORCE(particleSystem, repulsor).position = GetMousePosition();
-        FORCE(particleSystem, attractor).mass = 0.f;
-        FORCE(particleSystem, repulsor).mass = 0.f;
+
+        SetForcePosition(
+            particleSystem,
+            attractor,
+            GetMousePosition()
+        );
+
+        SetForcePosition(
+            particleSystem,
+            repulsor,
+            GetMousePosition()
+        );
+
+        SetForceMass(
+            particleSystem,
+            attractor,
+           0.0f 
+        );
+
+        SetForceMass(
+            particleSystem,
+            repulsor,
+           0.0f 
+        );
+
         if (IsKeyDown(attractorKey))
         {
             isForceActive = true;
-            FORCE(particleSystem, attractor).mass = 9e5;
+            SetForceMass(
+                particleSystem,
+                attractor,
+                9e5f
+            );
         } else if (IsKeyDown(replusorKey)) {
             isForceActive = true;
-            FORCE(particleSystem, repulsor).mass = 5e5;
+            SetForceMass(
+                particleSystem,
+                repulsor,
+                5e5
+            );
         } else if(IsKeyDown(emitterKey)) {
             isEmitActive = true;
             EmitParticles(particleSystem, &defaultParticleProps, 4);
