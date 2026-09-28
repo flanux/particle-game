@@ -26,9 +26,15 @@ typedef struct ParticlePool
     float pLifetimes[MAX_PARTICLE_COUNT];
     float pLifespans[MAX_PARTICLE_COUNT];
 
-    Vector2 pPrevPositions[MAX_PARTICLE_COUNT];
-    Vector2 pPositions[MAX_PARTICLE_COUNT];     // aPositions
-    Vector2 pVelocities[MAX_PARTICLE_COUNT];
+    float pPrevPosX[MAX_PARTICLE_COUNT];
+    float pPrevPosY[MAX_PARTICLE_COUNT];
+
+    float pPosX[MAX_PARTICLE_COUNT];
+    float pPosY[MAX_PARTICLE_COUNT];
+    
+    float pVelX[MAX_PARTICLE_COUNT];
+    float pVelY[MAX_PARTICLE_COUNT];
+
     float pMasses[MAX_PARTICLE_COUNT];
 }ParticlePool;
 
@@ -42,29 +48,44 @@ typedef enum ForceType
     FORCE_REPULSE,
 }ForceType;
 
+typedef struct ForceHandle
+{
+    ForceType type;
+    size_t index;
+} ForceHandle;
+
 typedef struct Force
 {
-    uint32_t uid;
-    ForceType type;
-
-    // FORCE_VISCOUS
-    float viscosity; // Dynamic viscosity of the fluid
-
-    // FORCE_ATTRACT/FORCE_REPULSE
-    Vector2 position;
-    float mass;
-}Force;
-
-typedef struct ForcePool
-{
-    struct{
+    struct 
+    {
         uint32_t key;
-        Force* value;
+        ForceHandle value;
     } *addressMap;
 
     size_t activeCount;
-    Force objects[MAX_FORCES];
+
+    size_t gravityCount;
+
+    size_t viscosityCount;
+    float viscosity[MAX_FORCES];
+    uint32_t viscosityUids[MAX_FORCES];
+
+    size_t attractCount;
+    float attractPosX[MAX_FORCES];
+    float attractPosY[MAX_FORCES];
+    float attractMass[MAX_FORCES];
+    uint32_t attractUids[MAX_FORCES];
+
+    size_t repulseCount;
+    float repulsePosX[MAX_FORCES];
+    float repulsePosY[MAX_FORCES];
+    float repulseMass[MAX_FORCES];
+    uint32_t repulseUids[MAX_FORCES];
+
+    uint32_t gravityUids[MAX_FORCES];
+
 } ForcePool;
+
 
 // Constraints
 // -----------
@@ -142,8 +163,25 @@ void UpdateParticles(ParticleSystem *system, float deltaTime);
 void KillParticles(ParticleSystem *system, Vector2 position, float radius);
 
 uint32_t AddForce(ParticleSystem *system, ForceType type);
-Force* GetForce(ParticleSystem *system, uint32_t uid);
 void RemoveForce(ParticleSystem *system, uint32_t forceId);
+
+void SetForcePosition(
+    ParticleSystem *system,
+    uint32_t forceId,
+    Vector2 position
+);
+
+void SetForceMass(
+        ParticleSystem *system,
+        uint32_t forceId,
+        float mass
+);
+
+void SetForceViscosity(
+        ParticleSystem *system,
+        uint32_t forceId,
+        float viscosity
+);
 
 void InitParticleRender(const Shader *shader, float screenWidth, float screenHeight);
 void CleanUpParticleRender();
@@ -152,5 +190,3 @@ void DrawParticlesInstanced(const ParticleSystem *system);
 
 void AddSelfCollisionConstraint(ParticleSystem *system, size_t i, size_t j);
 void AddDistanceConstraint(ParticleSystem *system, size_t i, size_t j);
-
-#define FORCE(system, forceId) (*GetForce(system, forceId))
