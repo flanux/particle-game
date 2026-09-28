@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "particle.h"
+#include <immintrin.h>
 
 #include "hash.h"
 
@@ -22,6 +23,7 @@ static const float quadVertices[] = {
      0.5f,  0.5f, 1.0f, 1.0f,
 };
 static uint32_t quadVAO, quadVBO, instancePositionVBO, shaderId; //particle render state
+static Vector2 instancePositions[MAX_PARTICLE_COUNT];
 
 static ParticlePool* ConstructParticlePool_() 
 {
@@ -29,19 +31,10 @@ static ParticlePool* ConstructParticlePool_()
     PASSERT(particles, LOG_FATAL, "Failed to allocate particle particles");
     if(!particles) { return NULL; }
 
+    memset(particles, 0, sizeof(*particles));
+
     particles->activeCount = 0;
 
-    for (int i = 0; i < MAX_PARTICLE_COUNT; i++) 
-    {
-        particles->pLifetimes[i]  = 0.0f;
-        particles->pLifespans[i]  = 0.0f;
-
-        particles->pPrevPositions[i]    = (Vector2){ 0 };
-        particles->pPositions[i]        = (Vector2){ 0 };
-        particles->pVelocities[i]       = (Vector2){ 0 };
-
-        particles->pMasses[i]  = 0.0f;
-    }
     return particles;
 }
 
@@ -52,14 +45,19 @@ static void DestructParticlePool_(ParticlePool *particles)
 
 static void SwapParticles_(ParticlePool *particles, size_t i, size_t j)
 {
-    particles->pLifetimes[i]      = particles->pLifetimes[j];
-    particles->pLifespans[i]      = particles->pLifespans[j];
+    particles->pLifetimes[i] = particles->pLifetimes[j];
+    particles->pLifespans[i] = particles->pLifespans[j];
 
-    particles->pPrevPositions[i] = particles->pPrevPositions[j];
-    particles->pPositions[i]     = particles->pPositions[j];
-    particles->pVelocities[i]    = particles->pVelocities[j];
+    particles->pPrevPosX[i] = particles->pPrevPosX[j];
+    particles->pPrevPosY[i] = particles->pPrevPosY[j];
 
-    particles->pMasses[i]        = particles->pMasses[j];
+    particles->pPosX[i] = particles->pPosX[j];
+    particles->pPosY[i] = particles->pPosY[j];
+
+    particles->pVelX[i] = particles->pVelX[j];
+    particles->pVelY[i] = particles->pVelY[j];
+
+    particles->pMasses[i] = particles->pMasses[j];
 }
 
 static void KillParticle_(ParticlePool *particles, size_t index) 
@@ -74,7 +72,15 @@ void ProjectSelfCollision(const Constraint *this, ParticlePool *particles, float
         "Incorrect number of participants in self collision constraint. Constraint participants must equal 2.");
 
     const size_t i = this->participants[0], j = this->participants[1];
-    Vector2 pi = particles->pPositions[i], pj = particles->pPositions[j];
+    Vector2 pi = {
+        particles->pPosX[i],
+        particles->pPosY[i]
+    };
+
+    Vector2 pj = {
+        particles->pPosX[j],
+        particles->pPosY[j]
+    };
 
     Vector2 seperation  = Vector2Subtract(pj, pi);
     float distance      = Vector2Length(seperation);
@@ -95,8 +101,11 @@ void ProjectSelfCollision(const Constraint *this, ParticlePool *particles, float
     Vector2 deltaPi = Vector2Scale( gradientC, (lambda * iInvMass));
     Vector2 deltaPj = Vector2Scale( gradientC, (-1.0f * lambda * jInvMass));
 
-    particles->pPositions[i] = Vector2Add(pi, deltaPi);
-    particles->pPositions[j] = Vector2Add(pj, deltaPj);
+    particles->pPosX[i] = pi.x + deltaPi.x;
+    particles->pPosY[i] = pi.y + deltaPi.y;
+
+    particles->pPosX[j] = pj.x + deltaPj.x;
+    particles->pPosY[j] = pj.y + deltaPj.y;
 }
 
 void ProjectDistance(const Constraint *this, ParticlePool *particles, float deltaTime)
@@ -104,43 +113,108 @@ void ProjectDistance(const Constraint *this, ParticlePool *particles, float delt
     PASSERT(false, LOG_WARNING, "ProjectDistance function not implemented");
 }
 
-static Vector2 CalculateForces_(const ForcePool *forces, Vector2 pi, Vector2 vi, float mi)
+static Vector2 CalculateForces_(
+    const ForcePool *forces,
+    Vector2 pi,
+    Vector2 vi,
+    float mi
+)
 {
     Vector2 externalForces = (Vector2){ 0 };
 
-    for (size_t i = 0; i < forces->activeCount; i++)
+    // Gravity.
+    externalForces.y +=
+        mi * GRAVITIONAL_CONST * (float)forces->gravityCount;
+
+    // Viscous forces.
+    float totalViscosity = 0.0f;
+
+    for (size_t i = 0; i < forces->viscosityCount; i++)
     {
-        const Force *force = &(forces->objects[i]);
-        switch (force->type)
-        {
-        case FORCE_GRAVITY:
-            externalForces = Vector2Add(externalForces,
-                Vector2Scale((Vector2){0.0, GRAVITIONAL_CONST}, mi));
-            break;
-        case FORCE_VISCOUS:
-            externalForces = Vector2Add(externalForces,
-                Vector2Scale(vi, (-6.0f * PI * force->viscosity * PARTICLE_RADIUS)));
-            break;
-        case FORCE_ATTRACT:
-        case FORCE_REPULSE:
-            Vector2 forceDirection = Vector2Normalize(Vector2Subtract(force->position, pi));
-            const float distanceSqr = Vector2DistanceSqr(force->position, pi);
-            const float softening = 10.0f;
-            float strength = (mi * force->mass) / (distanceSqr + softening);
-
-            if (distanceSqr < 1.0f) { continue; }
-            if(force->type == FORCE_REPULSE) { strength *= -1.0; }
-
-            externalForces = Vector2Add(externalForces, 
-                                Vector2Scale(forceDirection, strength));
-            break;
-        default:
-            break;
-        }
+        totalViscosity += forces->viscosity[i];
     }
 
-    PASSERT(isfinite(externalForces.x) && isfinite(externalForces.y), LOG_ERROR, 
-        "externalForces invalid.");
+    const float viscosityScale =
+        -6.0f * PI * totalViscosity * PARTICLE_RADIUS;
+
+    externalForces.x += vi.x * viscosityScale;
+    externalForces.y += vi.y * viscosityScale;
+
+    // Attractors.
+    for (size_t i = 0; i < forces->attractCount; i++)
+    {
+        const float directionX =
+            forces->attractPosX[i] - pi.x;
+
+        const float directionY =
+            forces->attractPosY[i] - pi.y;
+
+        const float distanceSqr =
+            directionX * directionX +
+            directionY * directionY;
+
+        if (distanceSqr < 1.0f)
+        {
+            continue;
+        }
+
+        const float distance = sqrtf(distanceSqr);
+
+        const float normalizedX =
+            directionX / distance;
+
+        const float normalizedY =
+            directionY / distance;
+
+        const float strength =
+            (mi * forces->attractMass[i]) /
+            (distanceSqr + 10.0f);
+
+        externalForces.x += normalizedX * strength;
+        externalForces.y += normalizedY * strength;
+    }
+
+    // Repulsors.
+    for (size_t i = 0; i < forces->repulseCount; i++)
+    {
+        const float directionX =
+            forces->repulsePosX[i] - pi.x;
+
+        const float directionY =
+            forces->repulsePosY[i] - pi.y;
+
+        const float distanceSqr =
+            directionX * directionX +
+            directionY * directionY;
+
+        if (distanceSqr < 1.0f)
+        {
+            continue;
+        }
+
+        const float distance = sqrtf(distanceSqr);
+
+        const float normalizedX =
+            directionX / distance;
+
+        const float normalizedY =
+            directionY / distance;
+
+        const float strength =
+            -(mi * forces->repulseMass[i]) /
+            (distanceSqr + 10.0f);
+
+        externalForces.x += normalizedX * strength;
+        externalForces.y += normalizedY * strength;
+    }
+
+    PASSERT(
+        isfinite(externalForces.x) &&
+        isfinite(externalForces.y),
+        LOG_ERROR,
+        "externalForces invalid."
+    );
+
     return externalForces;
 }
 
@@ -156,22 +230,37 @@ static size_t GenerateCollisionConstraints_(ParticleSystem *system)
     {
         // Skip collision detection for particles in grace period
         if (system->particles_->pLifespans[i] < collisionGracePeriod) { continue; }
+
+        Vector2 pi = {
+            system->particles_->pPosX[i],
+            system->particles_->pPosY[i]
+        };
         
-        QueryHashPoint(system->spatialHash, system->particles_->pPositions[i], 2.0f * PARTICLE_RADIUS);
+        QueryHashPoint(system->spatialHash,
+                       pi,
+                       2.0f * PARTICLE_RADIUS);
         for (size_t j = 0; j < arrlenu(system->spatialHash->queryResults); j++)
         {
-            size_t pj = system->spatialHash->queryResults[j];
-            // Only process pair once (i < pj) to avoid duplicate constraints
-            if ( i == pj) { continue; }
-            // Skip collision if the other particle is also in grace period
-            if (system->particles_->pLifespans[pj] < collisionGracePeriod) { continue; }
-            
-            float dist = Vector2Distance(system->particles_->pPositions[i], system->particles_->pPositions[pj]);
-            // Guard against degenerate case where particles are at the same position
-            float minDistance = 1e-3;
-            if ( minDistance < dist && dist < range)
+            size_t particleIndex = system->spatialHash->queryResults[j];
+
+            if (i >= particleIndex) { continue; }
+
+            if (system->particles_->pLifespans[particleIndex] < collisionGracePeriod)
             {
-                AddSelfCollisionConstraint(system, i, pj);
+                continue;
+            }
+
+            Vector2 particlePosition = {
+                system->particles_->pPosX[particleIndex],
+                system->particles_->pPosY[particleIndex]
+            };
+
+            float dist = Vector2Distance(pi, particlePosition);
+
+            float minDistance = 1e-3f;
+            if (minDistance < dist && dist < range)
+            {
+                AddSelfCollisionConstraint(system, i, particleIndex);
                 collisionCount++;
             }
         }
@@ -182,36 +271,38 @@ static size_t GenerateCollisionConstraints_(ParticleSystem *system)
 static void HandleBoundaryCollisions_(ParticleSystem *system)
 {
     ParticlePool *particles = system->particles_;
-    const float restitution = 0.7;
-    const float friction = 0.01;
+    const float restitution = 0.7f;
+    const float friction = 0.01f;
+
     for (size_t i = 0; i < particles->activeCount; i++)
     {
-        Vector2 *pos = &particles->pPositions[i];
-        Vector2 *vel = &particles->pVelocities[i];
-        // Check X boundaries
-        if (pos->x < system->boundaryBox.left + PARTICLE_RADIUS)
+        float *posX = &particles->pPosX[i];
+        float *posY = &particles->pPosY[i];
+
+        if (*posX < system->boundaryBox.left + PARTICLE_RADIUS)
         {
-            pos->x = system->boundaryBox.left + PARTICLE_RADIUS;
-            vel->x *= -restitution;
-            vel->y *= (1.0f - friction);
-        } else if (system->boundaryBox.right - PARTICLE_RADIUS < pos->x)
+            *posX = system->boundaryBox.left + PARTICLE_RADIUS;
+            particles->pVelX[i] *= -restitution;
+            particles->pVelY[i] *= (1.0f - friction);
+        }
+        else if (system->boundaryBox.right - PARTICLE_RADIUS < *posX)
         {
-            pos->x = system->boundaryBox.right - PARTICLE_RADIUS;
-            vel->x *= -restitution;
-            vel->y *= (1.0f - friction);
+            *posX = system->boundaryBox.right - PARTICLE_RADIUS;
+            particles->pVelX[i] *= -restitution;
+            particles->pVelY[i] *= (1.0f - friction);
         }
 
-        // Check Y boundaries (separate from X)
-        if (pos->y < system->boundaryBox.bottom + PARTICLE_RADIUS)
+        if (*posY < system->boundaryBox.bottom + PARTICLE_RADIUS)
         {
-            pos->y = system->boundaryBox.bottom + PARTICLE_RADIUS;
-            vel->x *= (1.0f - friction);
-            vel->y *= -restitution;
-        } else if (system->boundaryBox.top - PARTICLE_RADIUS < pos->y)
+            *posY = system->boundaryBox.bottom + PARTICLE_RADIUS;
+            particles->pVelX[i] *= (1.0f - friction);
+            particles->pVelY[i] *= -restitution;
+        }
+        else if (system->boundaryBox.top - PARTICLE_RADIUS < *posY)
         {
-            pos->y = system->boundaryBox.top - PARTICLE_RADIUS;
-            vel->x *= (1.0f - friction);
-            vel->y *= -restitution;
+            *posY = system->boundaryBox.top - PARTICLE_RADIUS;
+            particles->pVelX[i] *= (1.0f - friction);
+            particles->pVelY[i] *= -restitution;
         }
     }
 }
@@ -240,48 +331,686 @@ static void UpdateParticleAttributes_(ParticleSystem *system)
 
 static void IntegrateVerlet_(ParticleSystem *system, float deltaTime)
 {
+
+    ParticlePool *particles = system->particles_;
+
     for (size_t i = 0; i < system->particles_->activeCount; i++)
     {
-        Vector2 forces = CalculateForces_(&system->forces_,
-            system->particles_->pPositions[i],
-            system->particles_->pVelocities[i],
-            system->particles_->pMasses[i]);
+        Vector2 position = {
+            particles->pPosX[i],
+            particles->pPosY[i]
+        };
 
-        system->particles_->pPrevPositions[i] = system->particles_->pPositions[i];
-        system->particles_->pPositions[i] = Vector2Add(
-                                                Vector2Add(system->particles_->pPositions[i],
-                                                    Vector2Scale(system->particles_->pVelocities[i], deltaTime)),
-                                                        Vector2Scale(forces, 
-                                                            (deltaTime * deltaTime * 1.0f / system->particles_->pMasses[i])));
+        Vector2 velocity = {
+            particles->pVelX[i],
+            particles->pVelY[i]
+        };
+
+        Vector2 forces = CalculateForces_(&system->forces_,
+                position,
+                velocity,
+                particles->pMasses[i]
+        );
+
+        particles->pPrevPosX[i] = particles->pPosX[i];
+        particles->pPrevPosY[i] = particles->pPosY[i];
+
+        particles->pPosX[i] +=
+         particles->pVelX[i] * deltaTime + 
+         forces.x * (deltaTime * deltaTime / particles->pMasses[i]);
+
+        particles->pPosY[i] +=
+         particles->pVelY[i] * deltaTime + 
+         forces.y * (deltaTime * deltaTime / particles->pMasses[i]);
     }
 }
 
-static void IntegrateEuler_(ParticleSystem *system, float deltaTime)
+static void IntegrateEuler_(
+    ParticleSystem *system,
+    float deltaTime
+)
 {
-    // Update particle velocites
-    for (size_t i = 0; i < system->particles_->activeCount; i++)
-    {
-        Vector2 forces = CalculateForces_(&system->forces_,
-            system->particles_->pPositions[i],
-            system->particles_->pVelocities[i],
-            system->particles_->pMasses[i]);
+    ParticlePool *particles = system->particles_;
+    const ForcePool *forces = &system->forces_;
 
-        system->particles_->pVelocities[i]  = Vector2Add(system->particles_->pVelocities[i],
-                                                Vector2Scale(forces,
-                                                    (deltaTime * 1.0f / system->particles_->pMasses[i])));
+    const size_t particleCount =
+        particles->activeCount;
+
+    float totalViscosity = 0.0f;
+
+    for (size_t j = 0; j < forces->viscosityCount; j++)
+    {
+        totalViscosity += forces->viscosity[j];
     }
 
-    // Update particle positions
-    for (size_t i = 0; i < system->particles_->activeCount; i++)
+    const float gravityScale =
+        GRAVITIONAL_CONST * (float)forces->gravityCount;
+
+    const __m256 dt =
+        _mm256_set1_ps(deltaTime);
+
+    const __m256 gravity =
+        _mm256_set1_ps(gravityScale);
+
+    const __m256 viscosity =
+        _mm256_set1_ps(
+            -6.0f *
+            PI *
+            totalViscosity *
+            PARTICLE_RADIUS
+        );
+
+    const __m256 one =
+        _mm256_set1_ps(1.0f);
+
+    const __m256 softening =
+        _mm256_set1_ps(10.0f);
+
+    for (size_t i = 0;
+         i + 8 <= particleCount;
+         i += 8)
     {
-        system->particles_->pPrevPositions[i] = system->particles_->pPositions[i];
-        system->particles_->pPositions[i] = Vector2Add(system->particles_->pPositions[i], 
-            Vector2Scale(system->particles_->pVelocities[i], deltaTime));
+        /*
+         * Load particle state.
+         */
+
+        const __m256 posX =
+            _mm256_loadu_ps(
+                &particles->pPosX[i]
+            );
+
+        const __m256 posY =
+            _mm256_loadu_ps(
+                &particles->pPosY[i]
+            );
+
+        __m256 velX =
+            _mm256_loadu_ps(
+                &particles->pVelX[i]
+            );
+
+        __m256 velY =
+            _mm256_loadu_ps(
+                &particles->pVelY[i]
+            );
+
+        const __m256 mass =
+            _mm256_loadu_ps(
+                &particles->pMasses[i]
+            );
+
+        /*
+         * Accumulated external force.
+         */
+
+        __m256 forceX =
+            _mm256_setzero_ps();
+
+        __m256 forceY =
+            _mm256_setzero_ps();
+
+        /*
+         * Gravity.
+         */
+
+        if (forces->gravityCount > 0)
+        {
+            forceY =
+                _mm256_mul_ps(
+                    mass,
+                    gravity
+                );
+        }
+
+        /*
+         * Viscosity.
+         */
+
+        if (totalViscosity != 0.0f)
+        {
+            forceX =
+                _mm256_add_ps(
+                    forceX,
+                    _mm256_mul_ps(
+                        velX,
+                        viscosity
+                    )
+                );
+
+            forceY =
+                _mm256_add_ps(
+                    forceY,
+                    _mm256_mul_ps(
+                        velY,
+                        viscosity
+                    )
+                );
+        }
+
+        /*
+         * Attractors.
+         */
+
+        for (size_t j = 0;
+             j < forces->attractCount;
+             j++)
+        {
+            const __m256 forcePosX =
+                _mm256_set1_ps(
+                    forces->attractPosX[j]
+                );
+
+            const __m256 forcePosY =
+                _mm256_set1_ps(
+                    forces->attractPosY[j]
+                );
+
+            const __m256 forceMass =
+                _mm256_set1_ps(
+                    forces->attractMass[j]
+                );
+
+            const __m256 directionX =
+                _mm256_sub_ps(
+                    forcePosX,
+                    posX
+                );
+
+            const __m256 directionY =
+                _mm256_sub_ps(
+                    forcePosY,
+                    posY
+                );
+
+            const __m256 distanceSqr =
+                _mm256_add_ps(
+                    _mm256_mul_ps(
+                        directionX,
+                        directionX
+                    ),
+                    _mm256_mul_ps(
+                        directionY,
+                        directionY
+                    )
+                );
+
+            const __m256 validMask =
+                _mm256_cmp_ps(
+                    distanceSqr,
+                    one,
+                    _CMP_GE_OQ
+                );
+
+            const __m256 safeDistanceSqr =
+                _mm256_max_ps(
+                    distanceSqr,
+                    one
+                );
+
+            const __m256 distance =
+                _mm256_sqrt_ps(
+                    safeDistanceSqr
+                );
+
+            const __m256 normalizedX =
+                _mm256_div_ps(
+                    directionX,
+                    distance
+                );
+
+            const __m256 normalizedY =
+                _mm256_div_ps(
+                    directionY,
+                    distance
+                );
+
+            const __m256 strength =
+                _mm256_div_ps(
+                    _mm256_mul_ps(
+                        mass,
+                        forceMass
+                    ),
+                    _mm256_add_ps(
+                        distanceSqr,
+                        softening
+                    )
+                );
+
+            const __m256 contributionX =
+                _mm256_mul_ps(
+                    normalizedX,
+                    strength
+                );
+
+            const __m256 contributionY =
+                _mm256_mul_ps(
+                    normalizedY,
+                    strength
+                );
+
+            forceX =
+                _mm256_add_ps(
+                    forceX,
+                    _mm256_and_ps(
+                        contributionX,
+                        validMask
+                    )
+                );
+
+            forceY =
+                _mm256_add_ps(
+                    forceY,
+                    _mm256_and_ps(
+                        contributionY,
+                        validMask
+                    )
+                );
+        }
+
+        /*
+         * Repulsors.
+         */
+
+        for (size_t j = 0;
+             j < forces->repulseCount;
+             j++)
+        {
+            const __m256 forcePosX =
+                _mm256_set1_ps(
+                    forces->repulsePosX[j]
+                );
+
+            const __m256 forcePosY =
+                _mm256_set1_ps(
+                    forces->repulsePosY[j]
+                );
+
+            const __m256 forceMass =
+                _mm256_set1_ps(
+                    forces->repulseMass[j]
+                );
+
+            const __m256 directionX =
+                _mm256_sub_ps(
+                    forcePosX,
+                    posX
+                );
+
+            const __m256 directionY =
+                _mm256_sub_ps(
+                    forcePosY,
+                    posY
+                );
+
+            const __m256 distanceSqr =
+                _mm256_add_ps(
+                    _mm256_mul_ps(
+                        directionX,
+                        directionX
+                    ),
+                    _mm256_mul_ps(
+                        directionY,
+                        directionY
+                    )
+                );
+
+            const __m256 validMask =
+                _mm256_cmp_ps(
+                    distanceSqr,
+                    one,
+                    _CMP_GE_OQ
+                );
+
+            const __m256 safeDistanceSqr =
+                _mm256_max_ps(
+                    distanceSqr,
+                    one
+                );
+
+            const __m256 distance =
+                _mm256_sqrt_ps(
+                    safeDistanceSqr
+                );
+
+            const __m256 normalizedX =
+                _mm256_div_ps(
+                    directionX,
+                    distance
+                );
+
+            const __m256 normalizedY =
+                _mm256_div_ps(
+                    directionY,
+                    distance
+                );
+
+            const __m256 strength =
+                _mm256_div_ps(
+                    _mm256_mul_ps(
+                        mass,
+                        forceMass
+                    ),
+                    _mm256_add_ps(
+                        distanceSqr,
+                        softening
+                    )
+                );
+
+            const __m256 contributionX =
+                _mm256_mul_ps(
+                    normalizedX,
+                    strength
+                );
+
+            const __m256 contributionY =
+                _mm256_mul_ps(
+                    normalizedY,
+                    strength
+                );
+
+            forceX =
+                _mm256_sub_ps(
+                    forceX,
+                    _mm256_and_ps(
+                        contributionX,
+                        validMask
+                    )
+                );
+
+            forceY =
+                _mm256_sub_ps(
+                    forceY,
+                    _mm256_and_ps(
+                        contributionY,
+                        validMask
+                    )
+                );
+        }
+
+        /*
+         * F = ma
+         *
+         * dv = F / m * dt
+         */
+
+        const __m256 inverseMass =
+            _mm256_div_ps(
+                dt,
+                mass
+            );
+
+        velX =
+            _mm256_add_ps(
+                velX,
+                _mm256_mul_ps(
+                    forceX,
+                    inverseMass
+                )
+            );
+
+        velY =
+            _mm256_add_ps(
+                velY,
+                _mm256_mul_ps(
+                    forceY,
+                    inverseMass
+                )
+            );
+
+        /*
+         * Integrate position.
+         */
+
+        const __m256 deltaX =
+            _mm256_mul_ps(
+                velX,
+                dt
+            );
+
+        const __m256 deltaY =
+            _mm256_mul_ps(
+                velY,
+                dt
+            );
+
+        const __m256 newPosX =
+            _mm256_add_ps(
+                posX,
+                deltaX
+            );
+
+        const __m256 newPosY =
+            _mm256_add_ps(
+                posY,
+                deltaY
+            );
+
+        /*
+         * Store velocity.
+         */
+
+        _mm256_storeu_ps(
+            &particles->pVelX[i],
+            velX
+        );
+
+        _mm256_storeu_ps(
+            &particles->pVelY[i],
+            velY
+        );
+
+        /*
+         *  Store previous position
+         */
+        _mm256_storeu_ps(&particles->pPrevPosX[i], posX);   
+        _mm256_storeu_ps(&particles->pPrevPosY[i], posY);   
+
+
+        /*
+         * Store position.
+         */
+
+        _mm256_storeu_ps(
+            &particles->pPosX[i],
+            newPosX
+        );
+
+        _mm256_storeu_ps(
+            &particles->pPosY[i],
+            newPosY
+        );
+    }
+
+    /*
+     * Scalar remainder.
+     */
+
+    for (size_t i = particleCount & ~((size_t)7);
+         i < particleCount;
+         i++)
+    {
+        Vector2 position = {
+            particles->pPosX[i],
+            particles->pPosY[i]
+        };
+
+        Vector2 velocity = {
+            particles->pVelX[i],
+            particles->pVelY[i]
+        };
+
+        const float mass =
+            particles->pMasses[i];
+
+        Vector2 force = {
+            0.0f,
+            0.0f
+        };
+
+        /*
+         * Gravity.
+         */
+
+        force.y +=
+            mass * gravityScale;
+
+        /*
+         * Viscosity.
+         */
+
+        const float viscosityForce =
+            -6.0f *
+            PI *
+            totalViscosity *
+            PARTICLE_RADIUS;
+
+        force.x +=
+            velocity.x *
+            viscosityForce;
+
+        force.y +=
+            velocity.y *
+            viscosityForce;
+
+        /*
+         * Attractors.
+         */
+
+        for (size_t j = 0;
+             j < forces->attractCount;
+             j++)
+        {
+            const float directionX =
+                forces->attractPosX[j] -
+                position.x;
+
+            const float directionY =
+                forces->attractPosY[j] -
+                position.y;
+
+            const float distanceSqr =
+                directionX * directionX +
+                directionY * directionY;
+
+            if (distanceSqr < 1.0f)
+            {
+                continue;
+            }
+
+            const float distance =
+                sqrtf(distanceSqr);
+
+            const float normalizedX =
+                directionX / distance;
+
+            const float normalizedY =
+                directionY / distance;
+
+            const float strength =
+                (mass * forces->attractMass[j]) /
+                (distanceSqr + 10.0f);
+
+            force.x +=
+                normalizedX * strength;
+
+            force.y +=
+                normalizedY * strength;
+        }
+
+        /*
+         * Repulsors.
+         */
+
+        for (size_t j = 0;
+             j < forces->repulseCount;
+             j++)
+        {
+            const float directionX =
+                forces->repulsePosX[j] -
+                position.x;
+
+            const float directionY =
+                forces->repulsePosY[j] -
+                position.y;
+
+            const float distanceSqr =
+                directionX * directionX +
+                directionY * directionY;
+
+            if (distanceSqr < 1.0f)
+            {
+                continue;
+            }
+
+            const float distance =
+                sqrtf(distanceSqr);
+
+            const float normalizedX =
+                directionX / distance;
+
+            const float normalizedY =
+                directionY / distance;
+
+            const float strength =
+                -(mass * forces->repulseMass[j]) /
+                (distanceSqr + 10.0f);
+
+            force.x +=
+                normalizedX * strength;
+
+            force.y +=
+                normalizedY * strength;
+        }
+
+        /*
+         * F = ma.
+         */
+
+        velocity.x +=
+            force.x *
+            deltaTime /
+            mass;
+
+        velocity.y +=
+            force.y *
+            deltaTime /
+            mass;
+
+        /*
+         * Integrate position.
+         */
+
+        position.x +=
+            velocity.x *
+            deltaTime;
+
+        position.y +=
+            velocity.y *
+            deltaTime;
+
+        particles->pVelX[i] =
+            velocity.x;
+
+        particles->pVelY[i] =
+            velocity.y;
+
+        particles->pPrevPosX[i] =
+            particles->pPosX[i];   
+
+        particles->pPrevPosY[i] =
+            particles->pPosY[i];
+
+        particles->pPosX[i] =
+            position.x;
+
+        particles->pPosY[i] =
+            position.y;
     }
 }
 
 static void UpdateParticlesMotion_(ParticleSystem *system, float deltaTime)
 {
+    ParticlePool *particles = system->particles_;
     // perform physics simulation updating particle attributes
     system->IntegrationFn(system, deltaTime);
 
@@ -308,9 +1037,12 @@ static void UpdateParticlesMotion_(ParticleSystem *system, float deltaTime)
     const float maxVelocity = 1000.0f; // Maximum velocity magnitude in pixels/second
     for (size_t i = 0; i < system->particles_->activeCount; i++)
     {
-        system->particles_->pVelocities[i] = Vector2Scale(
-            Vector2Subtract(system->particles_->pPositions[i], system->particles_->pPrevPositions[i]), 
-                (1.0f / deltaTime));
+        
+        particles->pVelX[i] =
+            (particles->pPosX[i] - particles->pPrevPosX[i]) / deltaTime;
+
+        particles->pVelY[i] =
+            (particles->pPosY[i] - particles->pPrevPosY[i]) / deltaTime;
     }
 
     HandleBoundaryCollisions_(system);
@@ -368,10 +1100,28 @@ void EmitParticles(ParticleSystem *system, const ParticleProps *props, uint32_t 
         system->particles_->pLifetimes[i]    = props->lifetime + (props->lifetime * (GetRandomValueF() * variance));
         system->particles_->pLifespans[i]    = 0;
 
-        system->particles_->pPositions[i]    = Vector2Add(system->emitter.position,
-                Vector2Scale((Vector2){ GetRandomValueF(), GetRandomValueF() }, (system->emitter.radius * variance)));
-        system->particles_->pVelocities[i]   = Vector2Add(props->velocity,
-                                                Vector2Scale(props->velocity, GetRandomValueF() * variance));
+        Vector2 position = Vector2Add(
+        system->emitter.position,
+        Vector2Scale(
+            (Vector2){ GetRandomValueF(), GetRandomValueF() },
+            system->emitter.radius * variance
+            )
+        );
+
+        system->particles_->pPosX[i] = position.x;
+        system->particles_->pPosY[i] = position.y;
+
+        system->particles_->pPrevPosX[i] = position.x;
+        system->particles_->pPrevPosY[i] = position.y;
+
+        Vector2 velocity = Vector2Add(
+            props->velocity,
+            Vector2Scale(props->velocity, GetRandomValueF() * variance)
+        );
+
+        system->particles_->pVelX[i] = velocity.x;
+        system->particles_->pVelY[i] = velocity.y;
+
         system->particles_->pMasses[i]       = props->mass;
     }
 }
@@ -397,7 +1147,13 @@ void KillParticles(ParticleSystem *system, Vector2 position, float radius)
     for (size_t i = 0; i < arrlen(system->spatialHash->queryResults); i++) 
     {
         size_t pi = system->spatialHash->queryResults[i];
-        if(Vector2Distance(system->particles_->pPositions[pi], position) < radius)
+
+        Vector2 particlePosition = {
+            system->particles_->pPosX[pi],
+            system->particles_->pPosY[pi]
+        };
+
+        if (Vector2Distance(particlePosition, position) < radius)
         {
             KillParticle_(system->particles_, pi);
         }
@@ -409,61 +1165,178 @@ uint32_t AddForce(ParticleSystem *system, ForceType type)
     // maintain static uid int across all invocations
     static uint32_t uid = 0;
 
-    // Get free index in forces_.objects array
-    size_t i = system->forces_.activeCount;
-    PASSERT(i < MAX_FORCES, LOG_WARNING, "active forces count exceeds MAX_FORCES");
-    if(!(i < MAX_FORCES)) { return -1; }
+    ForcePool *forces = &system->forces_;
 
-    system->forces_.activeCount += 1;
-
-    // initialize new force
-    Force *f = &(system->forces_.objects[i]);
-    f->uid = uid;
-    f->type = type;
-    f->viscosity = AIR_VISCOSITY;
-    f->position = (Vector2) { 0 };
-    f->mass = 0.0f;
-
-    // new force to address map
-    hmput(system->forces_.addressMap, uid, f);
-    return uid++;
-}
-
-Force* GetForce(ParticleSystem *system, uint32_t uid)
-{
-    Force *queryForce = (Force*)hmget(system->forces_.addressMap, uid);
-    PASSERT(queryForce != NULL, LOG_WARNING, "Unable to Get Force. Query return NULL.");
-    return queryForce;
-}
-
-void RemoveForce(ParticleSystem *system, uint32_t forceId)
-{
-    Force *f = GetForce(system, forceId);
-    if(!f) { return; }
-
-    // Get the index of the force in the object list
-    size_t i = ((uintptr_t)f - (uintptr_t)(system->forces_.objects)) / sizeof(Force);
-
-    // bounds check
-    const bool cond = (i < MAX_FORCES) && (&(system->forces_.objects[i]) == f);
-    PASSERT(cond, LOG_ERROR, "Unable to remove force from system. Force not found.");
-    if (!cond) { return; }
-
-    // remove key from map
-    hmdel(system->forces_.addressMap, forceId);
-
-    // decrement active counter
-    system->forces_.activeCount--;
-    size_t lastIndex = system->forces_.activeCount;
-
-    // Swap with last element only if current index i is not last index
-    if (i != lastIndex)
+    if (forces->activeCount >= MAX_FORCES)
     {
-        // move last element to hole
-        system->forces_.objects[i] = system->forces_.objects[lastIndex];
-        // Update map to point to new location
-        hmput(system->forces_.addressMap, system->forces_.objects[i].uid, &system->forces_.objects[i]);
+        return UINT32_MAX;
     }
+
+    const uint32_t forceId = uid++;
+
+    ForceHandle handle = {
+        .type = type,
+        .index = 0,
+    };
+
+    switch (type)
+    {
+        case FORCE_GRAVITY:
+        {
+                const size_t index = forces->gravityCount;
+
+                forces->gravityUids[index] = forceId;
+                forces->gravityCount++;
+
+                handle.index = index;
+                break;
+        }
+
+        case FORCE_VISCOUS:
+        {
+                const size_t index = forces->viscosityCount;
+
+                forces->viscosity[index] = AIR_VISCOSITY;
+                forces->viscosityUids[index] = forceId;
+                forces->viscosityCount++;
+
+                handle.index = index;
+                break;
+        }
+
+        case FORCE_ATTRACT:
+        {
+                const size_t index = forces->attractCount;
+
+                forces->attractPosX[index] = 0.0f;
+                forces->attractPosY[index] = 0.0f;
+                forces->attractMass[index] = 0.0f;
+                forces->attractUids[index] = forceId;
+
+                forces->attractCount++;
+
+                handle.index = index;
+                break;
+        }
+
+        case FORCE_REPULSE:
+        {
+                const size_t index = forces->repulseCount;
+
+                forces->repulsePosX[index] = 0.0f;
+                forces->repulsePosY[index] = 0.0f;
+                forces->repulseMass[index] = 0.0f;
+                forces->repulseUids[index] = forceId;
+
+                forces->repulseCount++;
+
+                handle.index = index;
+                break;
+        }
+
+        default:
+            PASSERT(false, LOG_ERROR, "unknown force type.");
+            return UINT32_MAX;
+    }
+
+    forces->activeCount++;
+
+    hmput(
+        forces->addressMap,
+        forceId,
+        handle
+    );
+
+    return forceId;
+}
+
+void SetForcePosition(
+    ParticleSystem *system,
+    uint32_t forceId,
+    Vector2 position
+)
+{
+    ForceHandle handle =
+        hmget(system->forces_.addressMap, forceId);
+
+    ForcePool *forces = &system->forces_;
+
+    switch (handle.type)
+    {
+    case FORCE_ATTRACT:
+        forces->attractPosX[handle.index] = position.x;
+        forces->attractPosY[handle.index] = position.y;
+        break;
+
+    case FORCE_REPULSE:
+        forces->repulsePosX[handle.index] = position.x;
+        forces->repulsePosY[handle.index] = position.y;
+        break;
+
+    default:
+        PASSERT(
+            false,
+            LOG_WARNING,
+            "Force does not have a position."
+        );
+        break;
+    }
+}
+
+void SetForceMass(
+    ParticleSystem *system,
+    uint32_t forceId,
+    float mass
+)
+{
+    ForceHandle handle =
+        hmget(system->forces_.addressMap, forceId);
+
+    ForcePool *forces = &system->forces_;
+
+    switch (handle.type)
+    {
+    case FORCE_ATTRACT:
+        forces->attractMass[handle.index] = mass;
+        break;
+
+    case FORCE_REPULSE:
+        forces->repulseMass[handle.index] = mass;
+        break;
+
+    default:
+        PASSERT(
+            false,
+            LOG_WARNING,
+            "Force does not have mass."
+        );
+        break;
+    }
+}
+
+void SetForceViscosity(
+    ParticleSystem *system,
+    uint32_t forceId,
+    float viscosity
+)
+{
+    ForceHandle handle =
+        hmget(system->forces_.addressMap, forceId);
+
+    ForcePool *forces = &system->forces_;
+
+    PASSERT(
+        handle.type == FORCE_VISCOUS,
+        LOG_WARNING,
+        "Force is not viscous."
+    );
+
+    if (handle.type != FORCE_VISCOUS)
+    {
+        return;
+    }
+
+    forces->viscosity[handle.index] = viscosity;
 }
 
 void InitParticleRender(const Shader *shader, float screenWidth, float screenHeight)
@@ -512,12 +1385,25 @@ void DrawParticlesInstanced(const ParticleSystem *system)
     rlEnableShader(shaderId);
     rlEnableVertexArray(quadVAO);
 
-    rlUpdateVertexBuffer(instancePositionVBO, 
-        system->particles_->pPositions,
+    for (size_t i = 0; i < system->particles_->activeCount; i++)
+    {
+        instancePositions[i].x = system->particles_->pPosX[i];
+        instancePositions[i].y = system->particles_->pPosY[i];
+    }
+
+    rlUpdateVertexBuffer(
+        instancePositionVBO,
+        instancePositions,
         system->particles_->activeCount * sizeof(Vector2),
-        0);
-    rlDrawVertexArrayInstanced(0, 6, system->particles_->activeCount);
-    
+        0
+    );
+
+    rlDrawVertexArrayInstanced(
+        0,
+        6,
+        system->particles_->activeCount
+    );
+
     rlDisableVertexArray();
     rlDisableShader();
 }
