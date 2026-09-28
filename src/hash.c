@@ -6,21 +6,11 @@
 Hash* ConstructHash(float s)
 {
     Hash *hash = (Hash*)malloc(sizeof(Hash));
+    memset(hash, 0, sizeof(*hash));
 
     hash->isCleared = true;
     hash->spacing   = s;
     hash->tableSize = CELL_COUNT;
-
-    for(size_t i = 0; i < hash->tableSize; i++)
-    {
-        hash->cellCount[i] = 0;
-        hash->cellStart[i] = 0;
-    }
-
-    for(size_t i = 0; i < MAX_PARTICLE_COUNT; i++)
-    {
-        hash->denseGrid[i] = 0;
-    }
 
     hash->queryResults = NULL;
     arrsetcap(hash->queryResults, MAX_PARTICLE_COUNT);
@@ -60,7 +50,7 @@ void FillHash(Hash *this, const ParticlePool *particles)
     // count the total number of particles in each cell
     for(size_t i = 0; i < particles->activeCount; i++)
     {
-        float x = particles->pPositions[i].x, y = particles->pPositions[i].y;
+        float x = particles->pPosX[i], y = particles->pPosY[i];
         // PASSERT((x > EPSILON && y > EPSILON), LOG_ERROR, "Particle position less than 0.");
 
         uint32_t cell = HashCoords_(
@@ -88,8 +78,8 @@ void FillHash(Hash *this, const ParticlePool *particles)
     for(size_t i = 0; i < particles->activeCount; i++)
     {
         uint32_t cell = HashCoords_(
-            CalculateCellCoord_(particles->pPositions[i].x, this->spacing),
-            CalculateCellCoord_(particles->pPositions[i].y, this->spacing),
+            CalculateCellCoord_(particles->pPosX[i], this->spacing),
+            CalculateCellCoord_(particles->pPosY[i], this->spacing),
             this->tableSize);
         PASSERT((cell >= 0 && cell < this->tableSize), LOG_ERROR, "Cell index out of range.");
         size_t index = --(this->cellStart[cell]);
