@@ -20,7 +20,7 @@ typedef struct Hash
     size_t denseGrid[MAX_PARTICLE_COUNT];
 
     size_t *queryResults;
-}Hash;
+} Hash;
 
 // Private methods
 // -----------------
