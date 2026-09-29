@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "particle.h"
 #include <immintrin.h>
+#include <omp.h>
 
 #include "hash.h"
 
@@ -64,48 +65,6 @@ static void KillParticle_(ParticlePool *particles, size_t index)
 {
     particles->activeCount--;
     SwapParticles_(particles, index, particles->activeCount);
-}
-
-void ProjectSelfCollision(const Constraint *this, ParticlePool *particles, float deltaTime)
-{
-    PASSERTRETURN(this->participantCount == 2, LOG_WARNING, 
-        "Incorrect number of participants in self collision constraint. Constraint participants must equal 2.");
-
-    const size_t i = this->participants[0], j = this->participants[1];
-    Vector2 pi = {
-        particles->pPosX[i],
-        particles->pPosY[i]
-    };
-
-    Vector2 pj = {
-        particles->pPosX[j],
-        particles->pPosY[j]
-    };
-
-    Vector2 seperation  = Vector2Subtract(pj, pi);
-    float distance      = Vector2Length(seperation);
-    Vector2 gradientC   = Vector2Normalize(seperation);
-    
-    float restLength      = 2.0f * PARTICLE_RADIUS;
-    float constraintEval  = (distance - restLength);
-    float iInvMass        = 1.0f / particles->pMasses[i], jInvMass = 1.0f / particles->pMasses[j];
-    
-    float lambda = constraintEval / (iInvMass + jInvMass);
-    
-    // Clamp maximum displacement to prevent instability
-    // Maximum displacement per iteration should not exceed particle radius / substeps
-    float maxDisplacement = PARTICLE_RADIUS / (float)PHYSICS_SUBSTEPS;
-    float maxLambda = maxDisplacement / fmaxf(iInvMass, jInvMass);
-    lambda = Clamp(lambda, -maxLambda, maxLambda);
-
-    Vector2 deltaPi = Vector2Scale( gradientC, (lambda * iInvMass));
-    Vector2 deltaPj = Vector2Scale( gradientC, (-1.0f * lambda * jInvMass));
-
-    particles->pPosX[i] = pi.x + deltaPi.x;
-    particles->pPosY[i] = pi.y + deltaPi.y;
-
-    particles->pPosX[j] = pj.x + deltaPj.x;
-    particles->pPosY[j] = pj.y + deltaPj.y;
 }
 
 void ProjectDistance(const Constraint *this, ParticlePool *particles, float deltaTime)
@@ -218,54 +177,87 @@ static Vector2 CalculateForces_(
     return externalForces;
 }
 
-static size_t GenerateCollisionConstraints_(ParticleSystem *system)
+static void ResolveSelfCollisions_(ParticleSystem *system)
 {
-    size_t collisionCount = 0;
-
-    // Check for particle self collision
     const float range = 2.0f * PARTICLE_RADIUS;
-    const float collisionGracePeriod = 0.05f; // Skip collision for newly spawned particles
+    const float rangeSqr = range * range;
+    const float collisionGracePeriod = 0.05f;
     
-    for (size_t i = 0; i < system->particles_->activeCount; i++)
+    Hash *hash = system->spatialHash;
+    ParticlePool *particles = system->particles_;
+    float inv_s = hash->inv_spacing;
+    float maxDisplacement = PARTICLE_RADIUS / (float)PHYSICS_SUBSTEPS;
+
+    for (size_t i = 0; i < particles->activeCount; i++)
     {
-        // Skip collision detection for particles in grace period
-        if (system->particles_->pLifespans[i] < collisionGracePeriod) { continue; }
+        if (particles->pLifespans[i] < collisionGracePeriod) { continue; }
 
-        Vector2 pi = {
-            system->particles_->pPosX[i],
-            system->particles_->pPosY[i]
-        };
-        
-        QueryHashPoint(system->spatialHash,
-                       pi,
-                       2.0f * PARTICLE_RADIUS);
-        for (size_t j = 0; j < arrlenu(system->spatialHash->queryResults); j++)
+        float px = particles->pPosX[i];
+        float py = particles->pPosY[i];
+        float mass_i = particles->pMasses[i];
+        float iInvMass = 1.0f / mass_i;
+
+        int x0 = (int)((px - range) * inv_s);
+        int y0 = (int)((py - range) * inv_s);
+        int x1 = (int)((px + range) * inv_s);
+        int y1 = (int)((py + range) * inv_s);
+
+        for(int cx = x0; cx <= x1; cx++)
         {
-            size_t particleIndex = system->spatialHash->queryResults[j];
-
-            if (i >= particleIndex) { continue; }
-
-            if (system->particles_->pLifespans[particleIndex] < collisionGracePeriod)
+            for(int cy = y0; cy <= y1; cy++)
             {
-                continue;
-            }
+                size_t h = HashCoords_(cx, cy);
 
-            Vector2 particlePosition = {
-                system->particles_->pPosX[particleIndex],
-                system->particles_->pPosY[particleIndex]
-            };
+                size_t start = hash->cellStart[h];
+                size_t end = start + hash->cellCount[h];
+            
+                for(size_t k = start; k < end; k++)
+                {
+                    size_t j = hash->denseGrid[k];
+                    
+                    // Skip self-collision and duplicates (i >= j ensures we only process each pair once)
+                    if (i >= j) continue; 
+                    if (particles->pLifespans[j] < collisionGracePeriod) continue;
 
-            float dist = Vector2Distance(pi, particlePosition);
+                    float dx = particles->pPosX[j] - px;
+                    float dy = particles->pPosY[j] - py;
+                    float distSqr = dx * dx + dy * dy;
 
-            float minDistance = 1e-3f;
-            if (minDistance < dist && dist < range)
-            {
-                AddSelfCollisionConstraint(system, i, particleIndex);
-                collisionCount++;
+                    if (distSqr < rangeSqr && distSqr > 1e-6f)
+                    {
+                        // Fast inverse square root (compiler optimizes this to rsqrt with -ffast-math)
+                        float inv_dist = 1.0f / sqrtf(distSqr);
+                        float nx = dx * inv_dist;
+                        float ny = dy * inv_dist;
+
+                        float restLength = 2.0f * PARTICLE_RADIUS;
+                        float constraintEval = (1.0f / inv_dist) - restLength; // dist - restLength
+                        
+                        float mass_j = particles->pMasses[j];
+                        float jInvMass = 1.0f / mass_j;
+
+                        float lambda = constraintEval / (iInvMass + jInvMass);
+
+                        // Clamp lambda to prevent instability
+                        float maxLambda = maxDisplacement / fmaxf(iInvMass, jInvMass);
+                        if (lambda > maxLambda) lambda = maxLambda;
+                        else if (lambda < -maxLambda) lambda = -maxLambda;
+
+                        // Apply positional corrections directly
+                        float deltaPix = nx * (lambda * iInvMass);
+                        float deltaPiy = ny * (lambda * iInvMass);
+                        float deltaPjx = nx * (-1.0f * lambda * jInvMass);
+                        float deltaPjy = ny * (-1.0f * lambda * jInvMass);
+
+                        particles->pPosX[i] += deltaPix;
+                        particles->pPosY[i] += deltaPiy;
+                        particles->pPosX[j] += deltaPjx;
+                        particles->pPosY[j] += deltaPjy;
+                    }
+                }
             }
         }
     }
-    return collisionCount;
 }
 
 static void HandleBoundaryCollisions_(ParticleSystem *system)
@@ -274,7 +266,10 @@ static void HandleBoundaryCollisions_(ParticleSystem *system)
     const float restitution = 0.7f;
     const float friction = 0.01f;
 
-    for (size_t i = 0; i < particles->activeCount; i++)
+    size_t count = particles->activeCount;
+
+    #pragma omp parallel for
+    for (size_t i = 0; i < count; i++)
     {
         float *posX = &particles->pPosX[i];
         float *posY = &particles->pPosY[i];
@@ -547,34 +542,13 @@ static void IntegrateEuler_(
                     one
                 );
 
-            const __m256 distance =
-                _mm256_sqrt_ps(
-                    safeDistanceSqr
-                );
+            // rsqrt and rcp are ~3-5x faster than sqrt and div. 
+            const __m256 rsqrt_dist = _mm256_rsqrt_ps(safeDistanceSqr);
+            const __m256 normalizedX = _mm256_mul_ps(directionX, rsqrt_dist);
+            const __m256 normalizedY = _mm256_mul_ps(directionY, rsqrt_dist);
 
-            const __m256 normalizedX =
-                _mm256_div_ps(
-                    directionX,
-                    distance
-                );
-
-            const __m256 normalizedY =
-                _mm256_div_ps(
-                    directionY,
-                    distance
-                );
-
-            const __m256 strength =
-                _mm256_div_ps(
-                    _mm256_mul_ps(
-                        mass,
-                        forceMass
-                    ),
-                    _mm256_add_ps(
-                        distanceSqr,
-                        softening
-                    )
-                );
+            const __m256 inv_denom = _mm256_rcp_ps(_mm256_add_ps(distanceSqr, softening));
+            const __m256 strength = _mm256_mul_ps(_mm256_mul_ps(mass, forceMass), inv_denom);
 
             const __m256 contributionX =
                 _mm256_mul_ps(
@@ -667,34 +641,12 @@ static void IntegrateEuler_(
                     one
                 );
 
-            const __m256 distance =
-                _mm256_sqrt_ps(
-                    safeDistanceSqr
-                );
+            const __m256 rsqrt_dist = _mm256_rsqrt_ps(safeDistanceSqr);
+            const __m256 normalizedX = _mm256_mul_ps(directionX, rsqrt_dist);
+            const __m256 normalizedY = _mm256_mul_ps(directionY, rsqrt_dist);
 
-            const __m256 normalizedX =
-                _mm256_div_ps(
-                    directionX,
-                    distance
-                );
-
-            const __m256 normalizedY =
-                _mm256_div_ps(
-                    directionY,
-                    distance
-                );
-
-            const __m256 strength =
-                _mm256_div_ps(
-                    _mm256_mul_ps(
-                        mass,
-                        forceMass
-                    ),
-                    _mm256_add_ps(
-                        distanceSqr,
-                        softening
-                    )
-                );
+            const __m256 inv_denom = _mm256_rcp_ps(_mm256_add_ps(distanceSqr, softening));
+            const __m256 strength = _mm256_mul_ps(_mm256_mul_ps(mass, forceMass), inv_denom);
 
             const __m256 contributionX =
                 _mm256_mul_ps(
@@ -897,18 +849,10 @@ static void IntegrateEuler_(
                 continue;
             }
 
-            const float distance =
-                sqrtf(distanceSqr);
-
-            const float normalizedX =
-                directionX / distance;
-
-            const float normalizedY =
-                directionY / distance;
-
-            const float strength =
-                (mass * forces->attractMass[j]) /
-                (distanceSqr + 10.0f);
+            const float inv_dist = 1.0f / sqrtf(distanceSqr); 
+            const float normalizedX = directionX * inv_dist;
+            const float normalizedY = directionY * inv_dist;
+            const float strength = (mass * forces->attractMass[j]) * (1.0f / (distanceSqr + 10.0f));
 
             force.x +=
                 normalizedX * strength;
@@ -942,18 +886,10 @@ static void IntegrateEuler_(
                 continue;
             }
 
-            const float distance =
-                sqrtf(distanceSqr);
-
-            const float normalizedX =
-                directionX / distance;
-
-            const float normalizedY =
-                directionY / distance;
-
-            const float strength =
-                -(mass * forces->repulseMass[j]) /
-                (distanceSqr + 10.0f);
+            const float inv_dist = 1.0f / sqrtf(distanceSqr); 
+            const float normalizedX = directionX * inv_dist;
+            const float normalizedY = directionY * inv_dist;
+            const float strength = (mass * forces->attractMass[j]) * (1.0f / (distanceSqr + 10.0f));
 
             force.x +=
                 normalizedX * strength;
@@ -1019,7 +955,7 @@ static void UpdateParticlesMotion_(ParticleSystem *system, float deltaTime)
     FillHash(system->spatialHash, system->particles_);
 
     // Generate self collision constraints
-    size_t collisionCount = GenerateCollisionConstraints_(system);
+    ResolveSelfCollisions_(system);
 
     // Project constraints (solver)
     for (size_t i = 0; i < arrlenu(system->constraints_); i++)
@@ -1028,14 +964,11 @@ static void UpdateParticlesMotion_(ParticleSystem *system, float deltaTime)
         c.ProjectFn(&c, system->particles_, deltaTime);
     }
 
-    // Remove collision constraints
-    // NOTE: Collision constraints must be added last because of removal strategy invariant.
-    arrsetlen(system->constraints_, (arrlen(system->constraints_) - collisionCount));
-    PASSERT((arrlen(system->constraints_) >= 0), LOG_ERROR, "");
-
-    // Update velocities after constraint solver
+    const float inv_dt = 1.0f / deltaTime;
+    size_t count = system->particles_->activeCount;
     const float maxVelocity = 1000.0f; // Maximum velocity magnitude in pixels/second
-    for (size_t i = 0; i < system->particles_->activeCount; i++)
+    #pragma omp parallel for
+    for (size_t i = 0; i < count; i++)
     {
         
         particles->pVelX[i] =
@@ -1406,18 +1339,6 @@ void DrawParticlesInstanced(const ParticleSystem *system)
 
     rlDisableVertexArray();
     rlDisableShader();
-}
-
-void AddSelfCollisionConstraint(ParticleSystem *system, size_t i, size_t j)
-{
-    Constraint c = { 0 };
-    c.type = CONSTRAINT_SELF_COLLISION;
-    c.participants[0] = i;
-    c.participants[1] = j;
-    c.participantCount = 2;
-    c.ProjectFn = ProjectSelfCollision;
-
-    arrput(system->constraints_, c);
 }
 
 void AddDistanceConstraint(ParticleSystem *system, size_t i, size_t j)

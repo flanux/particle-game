@@ -4,7 +4,9 @@
 
 #define X_Prim 92837111
 #define Y_Prim 689287499
-#define CELL_COUNT 22400
+
+#define CELL_COUNT 32768
+#define CELL_MASK (CELL_COUNT - 1)
 
 // Forward declaration
 typedef struct ParticlePool ParticlePool; 
@@ -13,10 +15,10 @@ typedef struct Hash
 {
     bool isCleared;
     float spacing;
-    uint32_t tableSize;
+    float inv_spacing;
 
     uint32_t cellCount[CELL_COUNT];
-    size_t cellStart[CELL_COUNT];
+    uint32_t cellStart[CELL_COUNT];
     size_t denseGrid[MAX_PARTICLE_COUNT];
 
     size_t *queryResults;
@@ -29,10 +31,10 @@ static inline int CalculateCellCoord_(float coord, float spacing)
     return (int)floor(coord / spacing);
 }
 
-static inline size_t HashCoords_(int xi, int yi, uint32_t tableSize)
+static inline size_t HashCoords_(int xi, int yi)
 {
     uint32_t h = ((uint32_t)xi * X_Prim) ^ ((uint32_t)yi * Y_Prim);
-    return h % tableSize;
+    return h & CELL_MASK;
 }
 
 // Interface methods

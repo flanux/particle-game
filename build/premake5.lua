@@ -213,7 +213,8 @@ filter("action:vs*")
 cdialect("C17")
 
 filter("action:gmake*")
-buildoptions({ "-std=gnu17" })
+buildoptions({ "-std=gnu17", "-fopenmp" })
+linkoptions({ "-fopenmp" })
 
 filter("action:gmake*", "platforms:x64")
 buildoptions({ "-mavx2" })
